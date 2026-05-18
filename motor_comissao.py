@@ -1,12 +1,12 @@
 """
-Motor de Comissão V2 - Portal Comercial Financeiro
+Motor de Comissão V3 - Portal Comercial Financeiro
 
-Melhorias V2:
-- Cruzamento Faturados x Recebido pela Nota Fiscal normalizada, removendo zeros à esquerda.
-- Rateio correto do recebimento por NF: calcula % recebido sobre o total da NF e aplica proporcionalmente em cada item.
-- Separação entre recebimento total e recebimento dentro do período de apuração.
-- Comissão liberada calculada pelo período de recebimento informado, ideal para fechamento 20 a 20.
-- Mantém status da comissão pelo recebimento total da NF.
+Regras principais:
+- Comissão liberada SEMPRE pela data de recebimento do período selecionado (20 a 20 ou intervalo informado), independente da data do faturamento.
+- Faturamento serve para calcular a comissão prevista e a base de rateio por item.
+- Recebimento serve para liberar comissão efetiva no período.
+- Cruzamento principal por Nota Fiscal normalizada.
+- Inadimplência opcional: se existir aba contendo "inadimpl", ela é lida e vinculada por vendedor/gerente quando possível.
 """
 from __future__ import annotations
 
@@ -45,7 +45,6 @@ def normalizar_produto(valor: Any) -> str:
 
 
 def normalizar_nf(valor: Any) -> str:
-    """Normaliza NF para cruzar 001879, 1879.0 e 000001879 como 1879."""
     if pd.isna(valor):
         return ""
     txt = str(valor).strip()
@@ -67,14 +66,15 @@ def para_numero(valor: Any) -> float:
         return 0.0
     if isinstance(valor, (int, float, np.number)):
         return float(valor)
-    txt = str(valor).strip().replace("R$", "").replace("%", "").strip()
+    txt_original = str(valor)
+    txt = txt_original.strip().replace("R$", "").replace("%", "").strip()
     if not txt:
         return 0.0
     if "," in txt:
         txt = txt.replace(".", "").replace(",", ".")
     try:
         num = float(txt)
-        if "%" in str(valor) and num > 1:
+        if "%" in txt_original and num > 1:
             return num / 100
         return num
     except ValueError:
@@ -94,7 +94,6 @@ def para_data(valor: Any) -> pd.Timestamp | pd.NaT:
     if isinstance(valor, pd.Timestamp):
         return valor
     if isinstance(valor, (int, float, np.number)):
-        # Datas do Excel/Protheus costumam vir como serial.
         try:
             return pd.to_datetime(float(valor), unit="D", origin="1899-12-30")
         except Exception:
@@ -108,6 +107,12 @@ def encontrar_coluna(df: pd.DataFrame, opcoes: list[str]) -> Optional[str]:
         chave = normalizar_texto(opcao)
         if chave in mapa:
             return mapa[chave]
+    # fallback por contains
+    for opcao in opcoes:
+        chave = normalizar_texto(opcao)
+        for c_norm, c_original in mapa.items():
+            if chave and chave in c_norm:
+                return c_original
     return None
 
 
@@ -178,7 +183,10 @@ def carregar_tabela_precos(caminho: Path) -> pd.DataFrame:
     tabela = pd.read_excel(caminho, sheet_name="Tabela de Preços")
     tabela["PRODUTO_KEY"] = tabela["Produto"].map(normalizar_produto)
     tabela["PRODUTO_BASE_KEY"] = tabela["PRODUTO_KEY"].map(produto_base)
-    tabela["TIPO_PRECO_NORM"] = tabela["TIPO_PRECO"].map(normalizar_texto) if "TIPO_PRECO" in tabela.columns else normalizar_texto(TIPO_PRECO_PADRAO)
+    if "TIPO_PRECO" in tabela.columns:
+        tabela["TIPO_PRECO_NORM"] = tabela["TIPO_PRECO"].map(normalizar_texto)
+    else:
+        tabela["TIPO_PRECO_NORM"] = normalizar_texto(TIPO_PRECO_PADRAO)
     return tabela
 
 
@@ -222,21 +230,23 @@ def calcular_comissoes(caminho: Path, data_inicio: Any = None, data_fim: Any = N
     mapa_perfil = dict(zip(classificacao["NOME_NORM"], classificacao["PERFIL"].map(normalizar_texto)))
 
     faturados["NF_KEY"] = faturados[col_nf_fat].map(normalizar_nf)
-    faturados["VALOR_FATURADO_ITEM"] = faturados.apply(lambda r: para_numero(r.get(COLUNA_BASE_COMISSAO, r.get("Vlr.Total", 0))), axis=1)
+    # Valor base por item: prioriza Valor Bruto, mas usa Vlr.Total se o bruto estiver vazio/zerado.
+    faturados["VALOR_FATURADO_ITEM"] = faturados.apply(
+        lambda r: para_numero(r.get(COLUNA_BASE_COMISSAO, 0)) or para_numero(r.get("Vlr.Total", 0)), axis=1
+    )
     total_fat_nf = faturados.groupby("NF_KEY", as_index=False)["VALOR_FATURADO_ITEM"].sum().rename(columns={"VALOR_FATURADO_ITEM": "VALOR_FATURADO_NF_TOTAL"})
 
     recebido["NF_KEY"] = recebido[col_nf_rec].map(normalizar_nf)
     recebido["VALOR_RECEBIDO_NUM"] = recebido[col_valor_recebido].map(para_numero)
     recebido["DATA_RECEBIMENTO"] = recebido[col_data_rec].map(para_data) if col_data_rec else pd.NaT
 
-    di = pd.to_datetime(data_inicio) if data_inicio is not None else None
-    dfim = pd.to_datetime(data_fim) if data_fim is not None else None
+    di = pd.to_datetime(data_inicio).normalize() if data_inicio is not None else None
+    dfim = pd.to_datetime(data_fim).normalize() if data_fim is not None else None
     recebido_periodo = recebido.copy()
     if di is not None and col_data_rec:
         recebido_periodo = recebido_periodo[recebido_periodo["DATA_RECEBIMENTO"] >= di]
     if dfim is not None and col_data_rec:
-        # inclui o dia final completo
-        recebido_periodo = recebido_periodo[recebido_periodo["DATA_RECEBIMENTO"] < (dfim + pd.Timedelta(days=1))]
+        recebido_periodo = recebido_periodo[recebido_periodo["DATA_RECEBIMENTO"] <= dfim]
 
     receb_total = recebido.groupby("NF_KEY", as_index=False).agg(
         VALOR_RECEBIDO_TOTAL=("VALOR_RECEBIDO_NUM", "sum"),
@@ -325,6 +335,7 @@ def calcular_comissoes(caminho: Path, data_inicio: Any = None, data_fim: Any = N
         comissao_prev_gerente = valor_faturado * perc_gerente
         comissao_lib_vendedor_total = comissao_prev_vendedor * perc_recebido_total
         comissao_lib_gerente_total = comissao_prev_gerente * perc_recebido_total
+        # ESSA É A COMISSÃO DO FECHAMENTO: só recebimentos dentro do intervalo selecionado.
         comissao_lib_vendedor_periodo = comissao_prev_vendedor * perc_recebido_periodo
         comissao_lib_gerente_periodo = comissao_prev_gerente * perc_recebido_periodo
 
@@ -334,6 +345,12 @@ def calcular_comissoes(caminho: Path, data_inicio: Any = None, data_fim: Any = N
             status = "PARCIAL"
         else:
             status = "LIBERADA"
+        if valor_recebido_periodo_nf <= 0:
+            status_periodo = "SEM RECEBIMENTO NO PERÍODO"
+        elif perc_recebido_periodo < 0.9999:
+            status_periodo = "RECEBIDA PARCIAL NO PERÍODO"
+        else:
+            status_periodo = "RECEBIDA NO PERÍODO"
 
         linhas_saida.append({
             "Nota Fiscal": nf,
@@ -376,11 +393,12 @@ def calcular_comissoes(caminho: Path, data_inicio: Any = None, data_fim: Any = N
             "Comissão Liberada Gerente Total": comissao_lib_gerente_total,
             "Comissão Liberada Gerente": comissao_lib_gerente_periodo,
             "Status Comissão": status,
+            "Status Período": status_periodo,
             "Observação": observacao,
         })
 
     saida = pd.DataFrame(linhas_saida)
-    resumo = saida.groupby(["Vendedor", "Perfil Vendedor", "Gerente", "Status Comissão"], dropna=False).agg(
+    resumo = saida.groupby(["Vendedor", "Perfil Vendedor", "Gerente", "Status Comissão", "Status Período"], dropna=False).agg(
         Valor_Faturado=("Valor Faturado", "sum"),
         Valor_Recebido_Total=("Valor Recebido Item Total", "sum"),
         Valor_Recebido_Periodo=("Valor Recebido Item Período", "sum"),
@@ -393,33 +411,86 @@ def calcular_comissoes(caminho: Path, data_inicio: Any = None, data_fim: Any = N
     return saida, resumo
 
 
-def salvar_excel(saida: pd.DataFrame, resumo: pd.DataFrame, caminho_saida: Path) -> None:
+def carregar_inadimplencia(caminho: Path, comissoes: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """Lê uma aba opcional de inadimplência.
+
+    Aceita nomes como Inadimplência, Inadimplencia, Inadimplentes.
+    Se a aba tiver Nota Fiscal, tenta puxar Vendedor/Gerente da base de comissões.
+    """
+    try:
+        xl = pd.ExcelFile(caminho)
+    except Exception:
+        return pd.DataFrame()
+    sheet = None
+    for s in xl.sheet_names:
+        if "INADIMPL" in normalizar_texto(s):
+            sheet = s
+            break
+    if sheet is None:
+        return pd.DataFrame()
+    inad = pd.read_excel(caminho, sheet_name=sheet)
+    if inad.empty:
+        return pd.DataFrame()
+
+    col_nf = encontrar_coluna(inad, ["Nota Fiscal", "NF", "Numero", "Título", "Titulo"])
+    col_valor = encontrar_coluna(inad, ["Valor", "Valor Aberto", "Saldo", "Saldo Aberto", "Valor Vencido", "Valor Original"])
+    col_vendedor = encontrar_coluna(inad, ["Vendedor", "Nome", "Vendedor 1"])
+    col_gerente = encontrar_coluna(inad, ["Gerente", "GERENTE"])
+    col_cliente = encontrar_coluna(inad, ["Cliente", "Nome Cliente", "Razão Social", "Razao Social"])
+    col_venc = encontrar_coluna(inad, ["Vencimento", "Data Vencimento", "DT Vencimento", "Vencto"])
+
+    saida = pd.DataFrame()
+    saida["Nota Fiscal"] = inad[col_nf] if col_nf else ""
+    saida["NF Chave"] = saida["Nota Fiscal"].map(normalizar_nf)
+    saida["Cliente"] = inad[col_cliente] if col_cliente else ""
+    saida["Valor Inadimplente"] = inad[col_valor].map(para_numero) if col_valor else 0.0
+    saida["Data Vencimento"] = inad[col_venc].map(para_data) if col_venc else pd.NaT
+    saida["Vendedor"] = inad[col_vendedor] if col_vendedor else ""
+    saida["Gerente"] = inad[col_gerente] if col_gerente else ""
+
+    if comissoes is not None and not comissoes.empty and "NF Chave" in comissoes.columns:
+        mapa = comissoes[["NF Chave", "Vendedor", "Gerente"]].drop_duplicates("NF Chave")
+        saida = saida.merge(mapa, on="NF Chave", how="left", suffixes=("", "_calc"))
+        saida["Vendedor"] = saida["Vendedor"].where(saida["Vendedor"].astype(str).str.strip() != "", saida.get("Vendedor_calc", ""))
+        saida["Gerente"] = saida["Gerente"].where(saida["Gerente"].astype(str).str.strip() != "", saida.get("Gerente_calc", ""))
+        saida = saida.drop(columns=[c for c in ["Vendedor_calc", "Gerente_calc"] if c in saida.columns])
+
+    return saida
+
+
+def salvar_excel(saida: pd.DataFrame, resumo: pd.DataFrame, caminho_saida: Path, inadimplencia: Optional[pd.DataFrame] = None) -> None:
     with pd.ExcelWriter(caminho_saida, engine="xlsxwriter") as writer:
         saida.to_excel(writer, sheet_name="Comissoes_Calculadas", index=False)
         resumo.to_excel(writer, sheet_name="Resumo", index=False)
+        if inadimplencia is not None and not inadimplencia.empty:
+            inadimplencia.to_excel(writer, sheet_name="Inadimplencia", index=False)
         workbook = writer.book
         header_fmt = workbook.add_format({"bold": True, "font_color": "white", "bg_color": "#12324A", "border": 1})
         money_fmt = workbook.add_format({"num_format": 'R$ #,##0.00'})
         perc_fmt = workbook.add_format({"num_format": '0.00%'})
         date_fmt = workbook.add_format({"num_format": 'dd/mm/yyyy'})
         text_fmt = workbook.add_format({"text_wrap": False})
-        formatos_moeda = {c for c in saida.columns if any(k in c for k in ["Valor", "Preço", "Comissão"])} | {c for c in resumo.columns if any(k in c or k.replace("ã","a") in c for k in ["Valor", "Comissao"])}
-        formatos_perc = {"Variação %", "% Comissão Vendedor", "% Comissão Gerente", "% Recebido Total", "% Recebido Período"}
-        for sheet_name, df in [("Comissoes_Calculadas", saida), ("Resumo", resumo)]:
+        for sheet_name, df in writer.sheets.items():
+            pass
+        dfs = [("Comissoes_Calculadas", saida), ("Resumo", resumo)]
+        if inadimplencia is not None and not inadimplencia.empty:
+            dfs.append(("Inadimplencia", inadimplencia))
+        for sheet_name, df in dfs:
             ws = writer.sheets[sheet_name]
             ws.freeze_panes(1, 0)
-            ws.autofilter(0, 0, len(df), len(df.columns) - 1)
+            if len(df.columns):
+                ws.autofilter(0, 0, max(len(df), 1), len(df.columns) - 1)
             for col_idx, col_name in enumerate(df.columns):
                 ws.write(0, col_idx, col_name, header_fmt)
                 largura = min(max(len(str(col_name)) + 3, 12), 38)
                 fmt = text_fmt
-                if col_name in formatos_moeda:
+                if any(k in str(col_name) for k in ["Valor", "Preço", "Comissão", "Comissao"]):
                     fmt = money_fmt
                     largura = max(largura, 16)
-                elif col_name in formatos_perc:
+                elif "%" in str(col_name) or "Variação" in str(col_name):
                     fmt = perc_fmt
                     largura = max(largura, 14)
-                elif "Data" in col_name:
+                elif "Data" in str(col_name):
                     fmt = date_fmt
                     largura = max(largura, 14)
                 ws.set_column(col_idx, col_idx, largura, fmt)
@@ -432,7 +503,8 @@ def main() -> None:
     if not caminho_entrada.exists():
         raise FileNotFoundError(f"Arquivo de entrada não encontrado: {caminho_entrada.resolve()}")
     saida, resumo = calcular_comissoes(caminho_entrada)
-    salvar_excel(saida, resumo, caminho_saida)
+    inad = carregar_inadimplencia(caminho_entrada, saida)
+    salvar_excel(saida, resumo, caminho_saida, inad)
     print("Arquivo gerado com sucesso:", caminho_saida.resolve())
     print("Linhas calculadas:", len(saida))
     print("Comissão liberada vendedor no período:", f"R$ {saida['Comissão Liberada Vendedor'].sum():,.2f}")
