@@ -1,13 +1,20 @@
 """
-Motor de Comissão V3 - Portal Comercial Financeiro
+Motor de Comissão V1 - Portal Comercial Financeiro
+Autor: Paula / ChatGPT
 
-Regras principais:
-- Comissão liberada SEMPRE pela data de recebimento do período selecionado (20 a 20 ou intervalo informado), independente da data do faturamento.
-- Faturamento serve para calcular a comissão prevista e a base de rateio por item.
-- Recebimento serve para liberar comissão efetiva no período.
-- Cruzamento principal por Nota Fiscal normalizada.
-- Inadimplência opcional: se existir aba contendo "inadimpl", ela é lida e vinculada por vendedor/gerente quando possível.
+Objetivo:
+- Ler a base Excel com as abas: Faturados, Recebido, Regras, Classificação e Tabela de Preços.
+- Cruzar Faturados x Recebido pela Nota Fiscal.
+- Confrontar preço praticado x tabela de preços somente para operações de venda.
+- Aplicar regras para Vendedor, Representante, Gerente e Microtech.
+- Gerar arquivo Excel com a aba Comissoes_Calculadas e Resumo.
+
+Como usar:
+1) Coloque este arquivo na mesma pasta da sua base Excel.
+2) Ajuste o nome do arquivo em ARQUIVO_ENTRADA, se necessário.
+3) Rode: python motor_comissao.py
 """
+
 from __future__ import annotations
 
 import re
@@ -18,15 +25,32 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+# =========================
+# CONFIGURAÇÕES PRINCIPAIS
+# =========================
 ARQUIVO_ENTRADA = "base.xlsx"
 ARQUIVO_SAIDA = "base_comissoes_calculadas.xlsx"
+
+# Como a tabela possui preços por UF e também Consumidor Final, usamos SP como padrão.
+# Se futuramente a base de faturados tiver UF do cliente, podemos trocar para leitura dinâmica por UF.
 UF_REFERENCIA_PADRAO = "SP"
 TIPO_PRECO_PADRAO = "Venda Direta"
+
+# Base financeira para cálculo da comissão.
+# Na base do Protheus, Vlr.Total pode vir como valor total/contratual repetido em várias linhas;
+# por isso usamos Valor Bruto como padrão. Se preferir, altere para "Vlr.Total".
 COLUNA_BASE_COMISSAO = "Valor Bruto"
+
+# Margem/regra especial Microtech já está parametrizada na matriz da aba Regras.
+# O sistema identifica Microtech pela linha/grupo/classificação/descrição/produto.
 PALAVRAS_MICROTECH = ["MICROTECH"]
 
 
+# =========================
+# FUNÇÕES AUXILIARES
+# =========================
 def normalizar_texto(valor: Any) -> str:
+    """Padroniza texto para comparação: sem acento, maiúsculo e sem espaços duplicados."""
     if pd.isna(valor):
         return ""
     txt = str(valor).strip()
@@ -36,6 +60,7 @@ def normalizar_texto(valor: Any) -> str:
 
 
 def normalizar_produto(valor: Any) -> str:
+    """Padroniza código de produto preservando zeros à esquerda quando vier como texto."""
     if pd.isna(valor):
         return ""
     txt = str(valor).strip()
@@ -44,80 +69,64 @@ def normalizar_produto(valor: Any) -> str:
     return txt.upper()
 
 
-def normalizar_nf(valor: Any) -> str:
-    if pd.isna(valor):
-        return ""
-    txt = str(valor).strip()
-    if txt.endswith(".0"):
-        txt = txt[:-2]
-    digitos = re.sub(r"\D", "", txt)
-    if not digitos:
-        return ""
-    return digitos.lstrip("0") or "0"
-
-
 def produto_base(codigo: str) -> str:
+    """Remove sufixos comuns para tentar uma segunda chave de busca de preço."""
     codigo = normalizar_produto(codigo)
     return re.sub(r"(_RV|_TC|_VD|_CF)$", "", codigo)
 
 
 def para_numero(valor: Any) -> float:
+    """Converte números em formatos pt-BR/Excel para float."""
     if pd.isna(valor):
         return 0.0
     if isinstance(valor, (int, float, np.number)):
         return float(valor)
-    txt_original = str(valor)
-    txt = txt_original.strip().replace("R$", "").replace("%", "").strip()
-    if not txt:
+    txt = str(valor).strip().replace("R$", "").replace("%", "").strip()
+    if txt == "":
         return 0.0
+    # Se vier como 1.234,56
     if "," in txt:
         txt = txt.replace(".", "").replace(",", ".")
     try:
         num = float(txt)
-        if "%" in txt_original and num > 1:
+        # Se for percentual em texto tipo 6,0%, já removemos %, então vira 6.0; converter para 0.06
+        if "%" in str(valor) and num > 1:
             return num / 100
         return num
     except ValueError:
         return 0.0
 
 
+
 def para_percentual(valor: Any) -> float:
+    """Converte percentual de comissão. Trata 1 como 1%, 6 como 6%, 0.06 como 6%."""
     num = para_numero(valor)
     if num > 0.2:
         return num / 100
     return num
 
-
-def para_data(valor: Any) -> pd.Timestamp | pd.NaT:
-    if pd.isna(valor):
-        return pd.NaT
-    if isinstance(valor, pd.Timestamp):
-        return valor
-    if isinstance(valor, (int, float, np.number)):
-        try:
-            return pd.to_datetime(float(valor), unit="D", origin="1899-12-30")
-        except Exception:
-            return pd.NaT
-    return pd.to_datetime(valor, errors="coerce", dayfirst=True)
-
-
 def encontrar_coluna(df: pd.DataFrame, opcoes: list[str]) -> Optional[str]:
+    """Encontra uma coluna mesmo com pequenas variações de nome."""
     mapa = {normalizar_texto(c): c for c in df.columns}
     for opcao in opcoes:
         chave = normalizar_texto(opcao)
         if chave in mapa:
             return mapa[chave]
-    # fallback por contains
-    for opcao in opcoes:
-        chave = normalizar_texto(opcao)
-        for c_norm, c_original in mapa.items():
-            if chave and chave in c_norm:
-                return c_original
     return None
 
 
+def formatar_percentual(p: float) -> str:
+    return f"{p:.2%}".replace(".", ",")
+
+
+# =========================
+# LEITURA DAS REGRAS
+# =========================
 def carregar_regras(caminho: Path) -> Tuple[Dict[Tuple[str, str], Any], pd.DataFrame]:
+    """Carrega regras fixas da esquerda e matriz dinâmica da direita da aba Regras."""
     regras_raw = pd.read_excel(caminho, sheet_name="Regras", header=None)
+
+    # Tabela esquerda: PERFIL | FINALIDADE | %
     regras_fixas: Dict[Tuple[str, str], Any] = {}
     for _, row in regras_raw.iloc[1:].iterrows():
         perfil = normalizar_texto(row.iloc[0])
@@ -129,6 +138,7 @@ def carregar_regras(caminho: Path) -> Tuple[Dict[Tuple[str, str], Any], pd.DataF
             else:
                 regras_fixas[(perfil, finalidade)] = para_percentual(perc)
 
+    # Matriz direita: colunas H:K, com cabeçalho na linha 2 do Excel = índice 1
     matriz = regras_raw.iloc[:, 7:11].copy()
     matriz.columns = ["TIPO", "VARIACAO", "COMISSAO_VENDEDOR", "COMISSAO_GERENTE"]
     matriz = matriz.iloc[2:].dropna(how="all")
@@ -140,15 +150,19 @@ def carregar_regras(caminho: Path) -> Tuple[Dict[Tuple[str, str], Any], pd.DataF
 
 
 def definir_faixa_variacao(tipo_regra: str, variacao: Optional[float]) -> str:
+    """Transforma variação numérica em faixa da matriz de regras."""
     if variacao is None or pd.isna(variacao):
         return "SEM PRECO TABELA"
+
     tipo = normalizar_texto(tipo_regra)
+
     if tipo == "MICROTECH":
         if variacao <= -0.10:
             return "ATE -10%"
         if variacao >= 0.10:
             return "+10% OU SUPERIOR"
         return "PRECO DE TABELA"
+
     if tipo == "REPRESENTANTE":
         if variacao <= -0.15:
             return "ATE -15%"
@@ -159,6 +173,8 @@ def definir_faixa_variacao(tipo_regra: str, variacao: Optional[float]) -> str:
         if variacao >= 0.05:
             return "5%"
         return "PRECO DE TABELA"
+
+    # VENDEDOR padrão
     if variacao <= -0.15:
         return "ATE -15%"
     if variacao <= -0.10:
@@ -173,12 +189,16 @@ def definir_faixa_variacao(tipo_regra: str, variacao: Optional[float]) -> str:
 def buscar_percentuais_matriz(matriz: pd.DataFrame, tipo_regra: str, faixa: str) -> Tuple[float, float]:
     tipo = normalizar_texto(tipo_regra)
     faixa_norm = normalizar_texto(faixa)
-    achado = matriz.loc[(matriz["TIPO_NORM"] == tipo) & (matriz["VARIACAO_NORM"] == faixa_norm)]
+    filtro = (matriz["TIPO_NORM"] == tipo) & (matriz["VARIACAO_NORM"] == faixa_norm)
+    achado = matriz.loc[filtro]
     if achado.empty:
         return 0.0, 0.0
     return float(achado.iloc[0]["COMISSAO_VENDEDOR"]), float(achado.iloc[0]["COMISSAO_GERENTE"])
 
 
+# =========================
+# TABELA DE PREÇOS
+# =========================
 def carregar_tabela_precos(caminho: Path) -> pd.DataFrame:
     tabela = pd.read_excel(caminho, sheet_name="Tabela de Preços")
     tabela["PRODUTO_KEY"] = tabela["Produto"].map(normalizar_produto)
@@ -191,86 +211,76 @@ def carregar_tabela_precos(caminho: Path) -> pd.DataFrame:
 
 
 def buscar_preco_tabela(tabela: pd.DataFrame, produto: Any, uf: str = UF_REFERENCIA_PADRAO) -> Tuple[float, str]:
+    """Busca preço por Produto + Tipo Preço + UF. Faz fallback para Consumidor Final."""
     prod_key = normalizar_produto(produto)
     prod_base_key = produto_base(prod_key)
     tipo_norm = normalizar_texto(TIPO_PRECO_PADRAO)
-    candidatos = tabela[(tabela["TIPO_PRECO_NORM"] == tipo_norm) & ((tabela["PRODUTO_KEY"] == prod_key) | (tabela["PRODUTO_BASE_KEY"] == prod_base_key))]
+
+    candidatos = tabela[
+        (tabela["TIPO_PRECO_NORM"] == tipo_norm)
+        & ((tabela["PRODUTO_KEY"] == prod_key) | (tabela["PRODUTO_BASE_KEY"] == prod_base_key))
+    ]
+
     if candidatos.empty:
         return 0.0, "Produto não encontrado na tabela"
+
     row = candidatos.iloc[0]
     coluna_preco = uf if uf in tabela.columns else UF_REFERENCIA_PADRAO
     preco = para_numero(row.get(coluna_preco, 0))
     origem = coluna_preco
+
     if preco <= 0 and "Consumidor Final" in tabela.columns:
         preco = para_numero(row.get("Consumidor Final", 0))
         origem = "Consumidor Final"
+
     if preco <= 0:
         return 0.0, "Preço zerado/não encontrado"
+
     return preco, origem
 
 
-def calcular_comissoes(caminho: Path, data_inicio: Any = None, data_fim: Any = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+# =========================
+# MOTOR PRINCIPAL
+# =========================
+def calcular_comissoes(caminho: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
     faturados = pd.read_excel(caminho, sheet_name="Faturados")
     recebido = pd.read_excel(caminho, sheet_name="Recebido")
     classificacao = pd.read_excel(caminho, sheet_name="Classificação", header=None)
     regras_fixas, matriz = carregar_regras(caminho)
     tabela_precos = carregar_tabela_precos(caminho)
 
+    # Padronização de colunas principais
     col_nf_fat = encontrar_coluna(faturados, ["Nota Fiscal", "NF", "Numero"])
     col_nf_rec = encontrar_coluna(recebido, ["Nota Fiscal", "NF", "Numero"])
     col_valor_recebido = encontrar_coluna(recebido, ["Valor Pago", "Valor", "Valor "])
-    col_data_rec = encontrar_coluna(recebido, ["Data", "Data ", "Data Recebimento", "DT Recebimento"])
+
     if not col_nf_fat or not col_nf_rec:
         raise ValueError("Não encontrei coluna de Nota Fiscal em Faturados e/ou Recebido.")
     if not col_valor_recebido:
         raise ValueError("Não encontrei coluna de Valor Pago na aba Recebido.")
 
+    # Mapa vendedor/representante
     classificacao.columns = ["NOME", "PERFIL"]
     classificacao["NOME_NORM"] = classificacao["NOME"].map(normalizar_texto)
     mapa_perfil = dict(zip(classificacao["NOME_NORM"], classificacao["PERFIL"].map(normalizar_texto)))
 
-    faturados["NF_KEY"] = faturados[col_nf_fat].map(normalizar_nf)
-    # Valor base por item: prioriza Valor Bruto, mas usa Vlr.Total se o bruto estiver vazio/zerado.
-    faturados["VALOR_FATURADO_ITEM"] = faturados.apply(
-        lambda r: para_numero(r.get(COLUNA_BASE_COMISSAO, 0)) or para_numero(r.get("Vlr.Total", 0)), axis=1
-    )
-    total_fat_nf = faturados.groupby("NF_KEY", as_index=False)["VALOR_FATURADO_ITEM"].sum().rename(columns={"VALOR_FATURADO_ITEM": "VALOR_FATURADO_NF_TOTAL"})
-
-    recebido["NF_KEY"] = recebido[col_nf_rec].map(normalizar_nf)
+    # Recebimentos por NF
+    recebido["NF_KEY"] = recebido[col_nf_rec].map(normalizar_produto)
     recebido["VALOR_RECEBIDO_NUM"] = recebido[col_valor_recebido].map(para_numero)
-    recebido["DATA_RECEBIMENTO"] = recebido[col_data_rec].map(para_data) if col_data_rec else pd.NaT
+    receb_por_nf = recebido.groupby("NF_KEY", as_index=False)["VALOR_RECEBIDO_NUM"].sum()
 
-    di = pd.to_datetime(data_inicio).normalize() if data_inicio is not None else None
-    dfim = pd.to_datetime(data_fim).normalize() if data_fim is not None else None
-    recebido_periodo = recebido.copy()
-    if di is not None and col_data_rec:
-        recebido_periodo = recebido_periodo[recebido_periodo["DATA_RECEBIMENTO"] >= di]
-    if dfim is not None and col_data_rec:
-        recebido_periodo = recebido_periodo[recebido_periodo["DATA_RECEBIMENTO"] <= dfim]
-
-    receb_total = recebido.groupby("NF_KEY", as_index=False).agg(
-        VALOR_RECEBIDO_TOTAL=("VALOR_RECEBIDO_NUM", "sum"),
-        DATA_RECEBIMENTO_INICIAL=("DATA_RECEBIMENTO", "min"),
-        DATA_RECEBIMENTO_FINAL=("DATA_RECEBIMENTO", "max"),
-    )
-    receb_periodo = recebido_periodo.groupby("NF_KEY", as_index=False).agg(
-        VALOR_RECEBIDO_PERIODO=("VALOR_RECEBIDO_NUM", "sum"),
-        DATA_RECEBIMENTO_PERIODO_INICIAL=("DATA_RECEBIMENTO", "min"),
-        DATA_RECEBIMENTO_PERIODO_FINAL=("DATA_RECEBIMENTO", "max"),
-    )
-
-    faturados = faturados.merge(total_fat_nf, on="NF_KEY", how="left")
-    faturados = faturados.merge(receb_total, on="NF_KEY", how="left")
-    faturados = faturados.merge(receb_periodo, on="NF_KEY", how="left")
-    for c in ["VALOR_RECEBIDO_TOTAL", "VALOR_RECEBIDO_PERIODO"]:
-        faturados[c] = faturados[c].fillna(0)
+    # Preparar faturados
+    faturados["NF_KEY"] = faturados[col_nf_fat].map(normalizar_produto)
+    faturados = faturados.merge(receb_por_nf, on="NF_KEY", how="left")
+    faturados["VALOR_RECEBIDO_NUM"] = faturados["VALOR_RECEBIDO_NUM"].fillna(0)
 
     linhas_saida = []
+
     for _, row in faturados.iterrows():
         nf = row.get(col_nf_fat, "")
         cliente = row.get("Nome Cliente", row.get("Cliente", ""))
         produto = row.get("Produto", "")
-        descricao = row.get("DESCRIÇÃO", row.get("Descrição", ""))
+        descricao = row.get("DESCRIÇÃO", "")
         vendedor = row.get("Nome", row.get("Vendedor 1", ""))
         gerente = row.get("GERENTE", "")
         finalidade = normalizar_texto(row.get("FINALIDADE", ""))
@@ -279,25 +289,30 @@ def calcular_comissoes(caminho: Path, data_inicio: Any = None, data_fim: Any = N
         classificacao_prod = normalizar_texto(row.get("CLASSIFICAÇÃO", ""))
         categoria = normalizar_texto(row.get("CATEGORIA", ""))
 
-        valor_faturado = para_numero(row.get("VALOR_FATURADO_ITEM", 0))
-        valor_nf_total = para_numero(row.get("VALOR_FATURADO_NF_TOTAL", valor_faturado))
+        valor_faturado = para_numero(row.get(COLUNA_BASE_COMISSAO, row.get("Vlr.Total", 0)))
         qtd = para_numero(row.get("Quantidade", 0))
         preco_unit = para_numero(row.get("Prc Unitario", 0))
         if preco_unit <= 0 and qtd > 0:
             preco_unit = valor_faturado / qtd
 
-        valor_recebido_total_nf = para_numero(row.get("VALOR_RECEBIDO_TOTAL", 0))
-        valor_recebido_periodo_nf = para_numero(row.get("VALOR_RECEBIDO_PERIODO", 0))
-        perc_recebido_total = 0.0 if valor_nf_total <= 0 else min(valor_recebido_total_nf / valor_nf_total, 1.0)
-        perc_recebido_periodo = 0.0 if valor_nf_total <= 0 else min(valor_recebido_periodo_nf / valor_nf_total, 1.0)
-        valor_recebido_item_total = valor_faturado * perc_recebido_total
-        valor_recebido_item_periodo = valor_faturado * perc_recebido_periodo
+        valor_recebido_nf = para_numero(row.get("VALOR_RECEBIDO_NUM", 0))
+        perc_recebido = 0.0 if valor_faturado <= 0 else min(valor_recebido_nf / valor_faturado, 1.0)
 
-        operacao = "LOCAÇÃO" if "LOCACAO" in finalidade or "LOCACAO" in categoria or "LOCACAO" in normalizar_texto(row.get("SEGMENTO", "")) else "VENDA"
-        perfil_vendedor = mapa_perfil.get(normalizar_texto(vendedor), "VENDEDOR")
+        operacao = "LOCAÇÃO" if "LOCACAO" in finalidade or "LOCACAO" in categoria else "VENDA"
+
+        vendedor_norm = normalizar_texto(vendedor)
+        perfil_vendedor = mapa_perfil.get(vendedor_norm, "VENDEDOR")
+
         texto_micro = " ".join([linha, grupo, classificacao_prod, normalizar_texto(descricao), normalizar_texto(produto)])
         eh_microtech = any(p in texto_micro for p in PALAVRAS_MICROTECH)
-        tipo_regra = "MICROTECH" if eh_microtech else ("REPRESENTANTE" if perfil_vendedor == "REPRESENTANTE" else "VENDEDOR")
+
+        # Define tipo da matriz para vendas com preço em tabela
+        if eh_microtech:
+            tipo_regra = "MICROTECH"
+        elif perfil_vendedor == "REPRESENTANTE":
+            tipo_regra = "REPRESENTANTE"
+        else:
+            tipo_regra = "VENDEDOR"
 
         preco_tabela = 0.0
         origem_preco = "Não aplicável"
@@ -311,8 +326,9 @@ def calcular_comissoes(caminho: Path, data_inicio: Any = None, data_fim: Any = N
         regra_gerente = regras_fixas.get(("GERENTE", finalidade), 0.0)
 
         if operacao == "LOCAÇÃO":
-            perc_vendedor = 0.0 if regra_vendedor == "TABELA" else para_percentual(regra_vendedor)
-            perc_gerente = 0.0 if regra_gerente == "TABELA" else para_percentual(regra_gerente)
+            # Locação não tem variação por preço. Usa regra fixa da finalidade.
+            perc_vendedor = 0.0 if regra_vendedor == "TABELA" else para_numero(regra_vendedor)
+            perc_gerente = 0.0 if regra_gerente == "TABELA" else para_numero(regra_gerente)
             faixa = "Regra fixa locação"
         else:
             if regra_vendedor == "TABELA":
@@ -327,187 +343,126 @@ def calcular_comissoes(caminho: Path, data_inicio: Any = None, data_fim: Any = N
                     faixa = "Sem preço tabela"
                     observacao = origem_preco
             else:
+                # Venda com regra fixa por finalidade, sem confronto com tabela.
                 perc_vendedor = para_percentual(regra_vendedor)
                 perc_gerente = para_percentual(regra_gerente)
                 faixa = "Regra fixa venda"
 
         comissao_prev_vendedor = valor_faturado * perc_vendedor
         comissao_prev_gerente = valor_faturado * perc_gerente
-        comissao_lib_vendedor_total = comissao_prev_vendedor * perc_recebido_total
-        comissao_lib_gerente_total = comissao_prev_gerente * perc_recebido_total
-        # ESSA É A COMISSÃO DO FECHAMENTO: só recebimentos dentro do intervalo selecionado.
-        comissao_lib_vendedor_periodo = comissao_prev_vendedor * perc_recebido_periodo
-        comissao_lib_gerente_periodo = comissao_prev_gerente * perc_recebido_periodo
+        comissao_lib_vendedor = comissao_prev_vendedor * perc_recebido
+        comissao_lib_gerente = comissao_prev_gerente * perc_recebido
 
-        if valor_recebido_total_nf <= 0:
+        if valor_recebido_nf <= 0:
             status = "PREVISTA"
-        elif perc_recebido_total < 0.9999:
+        elif perc_recebido < 0.9999:
             status = "PARCIAL"
         else:
             status = "LIBERADA"
-        if valor_recebido_periodo_nf <= 0:
-            status_periodo = "SEM RECEBIMENTO NO PERÍODO"
-        elif perc_recebido_periodo < 0.9999:
-            status_periodo = "RECEBIDA PARCIAL NO PERÍODO"
-        else:
-            status_periodo = "RECEBIDA NO PERÍODO"
 
-        linhas_saida.append({
-            "Nota Fiscal": nf,
-            "NF Chave": row.get("NF_KEY", ""),
-            "Cliente": cliente,
-            "Produto": produto,
-            "Descrição": descricao,
-            "Finalidade": row.get("FINALIDADE", ""),
-            "Operação": operacao,
-            "Linha": row.get("LINHA DE PRODUTO", ""),
-            "Grupo": row.get("GRUPO", ""),
-            "Vendedor": vendedor,
-            "Perfil Vendedor": perfil_vendedor,
-            "Gerente": gerente,
-            "Tipo Regra": tipo_regra,
-            "Qtd": qtd,
-            "Preço Praticado": preco_unit,
-            "Preço Tabela": preco_tabela,
-            "Origem Preço": origem_preco,
-            "Variação %": variacao if not pd.isna(variacao) else np.nan,
-            "Faixa": faixa,
-            "% Comissão Vendedor": perc_vendedor,
-            "% Comissão Gerente": perc_gerente,
-            "Valor Faturado": valor_faturado,
-            "Valor Faturado NF Total": valor_nf_total,
-            "Valor Recebido NF Total": valor_recebido_total_nf,
-            "Valor Recebido Item Total": valor_recebido_item_total,
-            "% Recebido Total": perc_recebido_total,
-            "Valor Recebido NF Período": valor_recebido_periodo_nf,
-            "Valor Recebido Item Período": valor_recebido_item_periodo,
-            "% Recebido Período": perc_recebido_periodo,
-            "Data Recebimento Inicial": row.get("DATA_RECEBIMENTO_INICIAL", pd.NaT),
-            "Data Recebimento Final": row.get("DATA_RECEBIMENTO_FINAL", pd.NaT),
-            "Data Recebimento Período Inicial": row.get("DATA_RECEBIMENTO_PERIODO_INICIAL", pd.NaT),
-            "Data Recebimento Período Final": row.get("DATA_RECEBIMENTO_PERIODO_FINAL", pd.NaT),
-            "Comissão Prevista Vendedor": comissao_prev_vendedor,
-            "Comissão Liberada Vendedor Total": comissao_lib_vendedor_total,
-            "Comissão Liberada Vendedor": comissao_lib_vendedor_periodo,
-            "Comissão Prevista Gerente": comissao_prev_gerente,
-            "Comissão Liberada Gerente Total": comissao_lib_gerente_total,
-            "Comissão Liberada Gerente": comissao_lib_gerente_periodo,
-            "Status Comissão": status,
-            "Status Período": status_periodo,
-            "Observação": observacao,
-        })
+        linhas_saida.append(
+            {
+                "Nota Fiscal": nf,
+                "Cliente": cliente,
+                "Produto": produto,
+                "Descrição": descricao,
+                "Finalidade": row.get("FINALIDADE", ""),
+                "Operação": operacao,
+                "Linha": row.get("LINHA DE PRODUTO", ""),
+                "Grupo": row.get("GRUPO", ""),
+                "Vendedor": vendedor,
+                "Perfil Vendedor": perfil_vendedor,
+                "Gerente": gerente,
+                "Tipo Regra": tipo_regra,
+                "Qtd": qtd,
+                "Preço Praticado": preco_unit,
+                "Preço Tabela": preco_tabela,
+                "Origem Preço": origem_preco,
+                "Variação %": variacao if not pd.isna(variacao) else np.nan,
+                "Faixa": faixa,
+                "% Comissão Vendedor": perc_vendedor,
+                "% Comissão Gerente": perc_gerente,
+                "Valor Faturado": valor_faturado,
+                "Valor Recebido NF": valor_recebido_nf,
+                "% Recebido": perc_recebido,
+                "Comissão Prevista Vendedor": comissao_prev_vendedor,
+                "Comissão Liberada Vendedor": comissao_lib_vendedor,
+                "Comissão Prevista Gerente": comissao_prev_gerente,
+                "Comissão Liberada Gerente": comissao_lib_gerente,
+                "Status Comissão": status,
+                "Observação": observacao,
+            }
+        )
 
     saida = pd.DataFrame(linhas_saida)
-    resumo = saida.groupby(["Vendedor", "Perfil Vendedor", "Gerente", "Status Comissão", "Status Período"], dropna=False).agg(
+
+    resumo = saida.groupby(["Vendedor", "Perfil Vendedor", "Gerente", "Status Comissão"], dropna=False).agg(
         Valor_Faturado=("Valor Faturado", "sum"),
-        Valor_Recebido_Total=("Valor Recebido Item Total", "sum"),
-        Valor_Recebido_Periodo=("Valor Recebido Item Período", "sum"),
+        Valor_Recebido=("Valor Recebido NF", "sum"),
         Comissao_Prevista_Vendedor=("Comissão Prevista Vendedor", "sum"),
-        Comissao_Liberada_Vendedor_Periodo=("Comissão Liberada Vendedor", "sum"),
+        Comissao_Liberada_Vendedor=("Comissão Liberada Vendedor", "sum"),
         Comissao_Prevista_Gerente=("Comissão Prevista Gerente", "sum"),
-        Comissao_Liberada_Gerente_Periodo=("Comissão Liberada Gerente", "sum"),
+        Comissao_Liberada_Gerente=("Comissão Liberada Gerente", "sum"),
         Qtde_Notas=("Nota Fiscal", "nunique"),
     ).reset_index()
+
     return saida, resumo
 
 
-def carregar_inadimplencia(caminho: Path, comissoes: Optional[pd.DataFrame] = None) -> pd.DataFrame:
-    """Lê uma aba opcional de inadimplência.
-
-    Aceita nomes como Inadimplência, Inadimplencia, Inadimplentes.
-    Se a aba tiver Nota Fiscal, tenta puxar Vendedor/Gerente da base de comissões.
-    """
-    try:
-        xl = pd.ExcelFile(caminho)
-    except Exception:
-        return pd.DataFrame()
-    sheet = None
-    for s in xl.sheet_names:
-        if "INADIMPL" in normalizar_texto(s):
-            sheet = s
-            break
-    if sheet is None:
-        return pd.DataFrame()
-    inad = pd.read_excel(caminho, sheet_name=sheet)
-    if inad.empty:
-        return pd.DataFrame()
-
-    col_nf = encontrar_coluna(inad, ["Nota Fiscal", "NF", "Numero", "Título", "Titulo"])
-    col_valor = encontrar_coluna(inad, ["Valor", "Valor Aberto", "Saldo", "Saldo Aberto", "Valor Vencido", "Valor Original"])
-    col_vendedor = encontrar_coluna(inad, ["Vendedor", "Nome", "Vendedor 1"])
-    col_gerente = encontrar_coluna(inad, ["Gerente", "GERENTE"])
-    col_cliente = encontrar_coluna(inad, ["Cliente", "Nome Cliente", "Razão Social", "Razao Social"])
-    col_venc = encontrar_coluna(inad, ["Vencimento", "Data Vencimento", "DT Vencimento", "Vencto"])
-
-    saida = pd.DataFrame()
-    saida["Nota Fiscal"] = inad[col_nf] if col_nf else ""
-    saida["NF Chave"] = saida["Nota Fiscal"].map(normalizar_nf)
-    saida["Cliente"] = inad[col_cliente] if col_cliente else ""
-    saida["Valor Inadimplente"] = inad[col_valor].map(para_numero) if col_valor else 0.0
-    saida["Data Vencimento"] = inad[col_venc].map(para_data) if col_venc else pd.NaT
-    saida["Vendedor"] = inad[col_vendedor] if col_vendedor else ""
-    saida["Gerente"] = inad[col_gerente] if col_gerente else ""
-
-    if comissoes is not None and not comissoes.empty and "NF Chave" in comissoes.columns:
-        mapa = comissoes[["NF Chave", "Vendedor", "Gerente"]].drop_duplicates("NF Chave")
-        saida = saida.merge(mapa, on="NF Chave", how="left", suffixes=("", "_calc"))
-        saida["Vendedor"] = saida["Vendedor"].where(saida["Vendedor"].astype(str).str.strip() != "", saida.get("Vendedor_calc", ""))
-        saida["Gerente"] = saida["Gerente"].where(saida["Gerente"].astype(str).str.strip() != "", saida.get("Gerente_calc", ""))
-        saida = saida.drop(columns=[c for c in ["Vendedor_calc", "Gerente_calc"] if c in saida.columns])
-
-    return saida
-
-
-def salvar_excel(saida: pd.DataFrame, resumo: pd.DataFrame, caminho_saida: Path, inadimplencia: Optional[pd.DataFrame] = None) -> None:
+def salvar_excel(saida: pd.DataFrame, resumo: pd.DataFrame, caminho_saida: Path) -> None:
+    """Salva Excel com formatação leve e rápida."""
     with pd.ExcelWriter(caminho_saida, engine="xlsxwriter") as writer:
         saida.to_excel(writer, sheet_name="Comissoes_Calculadas", index=False)
         resumo.to_excel(writer, sheet_name="Resumo", index=False)
-        if inadimplencia is not None and not inadimplencia.empty:
-            inadimplencia.to_excel(writer, sheet_name="Inadimplencia", index=False)
+
         workbook = writer.book
-        header_fmt = workbook.add_format({"bold": True, "font_color": "white", "bg_color": "#12324A", "border": 1})
+        header_fmt = workbook.add_format({"bold": True, "font_color": "white", "bg_color": "#1F4E78", "border": 1})
         money_fmt = workbook.add_format({"num_format": 'R$ #,##0.00'})
         perc_fmt = workbook.add_format({"num_format": '0.00%'})
-        date_fmt = workbook.add_format({"num_format": 'dd/mm/yyyy'})
         text_fmt = workbook.add_format({"text_wrap": False})
-        for sheet_name, df in writer.sheets.items():
-            pass
-        dfs = [("Comissoes_Calculadas", saida), ("Resumo", resumo)]
-        if inadimplencia is not None and not inadimplencia.empty:
-            dfs.append(("Inadimplencia", inadimplencia))
-        for sheet_name, df in dfs:
+
+        formatos_moeda = {
+            "Preço Praticado", "Preço Tabela", "Valor Faturado", "Valor Recebido NF",
+            "Comissão Prevista Vendedor", "Comissão Liberada Vendedor",
+            "Comissão Prevista Gerente", "Comissão Liberada Gerente",
+            "Valor_Faturado", "Valor_Recebido", "Comissao_Prevista_Vendedor",
+            "Comissao_Liberada_Vendedor", "Comissao_Prevista_Gerente", "Comissao_Liberada_Gerente"
+        }
+        formatos_perc = {"Variação %", "% Comissão Vendedor", "% Comissão Gerente", "% Recebido"}
+
+        for sheet_name, df in [("Comissoes_Calculadas", saida), ("Resumo", resumo)]:
             ws = writer.sheets[sheet_name]
             ws.freeze_panes(1, 0)
-            if len(df.columns):
-                ws.autofilter(0, 0, max(len(df), 1), len(df.columns) - 1)
+            ws.autofilter(0, 0, len(df), len(df.columns) - 1)
             for col_idx, col_name in enumerate(df.columns):
                 ws.write(0, col_idx, col_name, header_fmt)
                 largura = min(max(len(str(col_name)) + 3, 12), 38)
                 fmt = text_fmt
-                if any(k in str(col_name) for k in ["Valor", "Preço", "Comissão", "Comissao"]):
+                if col_name in formatos_moeda:
                     fmt = money_fmt
                     largura = max(largura, 16)
-                elif "%" in str(col_name) or "Variação" in str(col_name):
+                elif col_name in formatos_perc:
                     fmt = perc_fmt
                     largura = max(largura, 14)
-                elif "Data" in str(col_name):
-                    fmt = date_fmt
-                    largura = max(largura, 14)
                 ws.set_column(col_idx, col_idx, largura, fmt)
-
 
 def main() -> None:
     base_dir = Path(__file__).resolve().parent
     caminho_entrada = base_dir / ARQUIVO_ENTRADA
     caminho_saida = base_dir / ARQUIVO_SAIDA
+
     if not caminho_entrada.exists():
         raise FileNotFoundError(f"Arquivo de entrada não encontrado: {caminho_entrada.resolve()}")
+
     saida, resumo = calcular_comissoes(caminho_entrada)
-    inad = carregar_inadimplencia(caminho_entrada, saida)
-    salvar_excel(saida, resumo, caminho_saida, inad)
+    salvar_excel(saida, resumo, caminho_saida)
+
     print("Arquivo gerado com sucesso:", caminho_saida.resolve())
     print("Linhas calculadas:", len(saida))
-    print("Comissão liberada vendedor no período:", f"R$ {saida['Comissão Liberada Vendedor'].sum():,.2f}")
+    print("Comissão prevista vendedor:", f"R$ {saida['Comissão Prevista Vendedor'].sum():,.2f}")
+    print("Comissão liberada vendedor:", f"R$ {saida['Comissão Liberada Vendedor'].sum():,.2f}")
+    print("Comissão prevista gerente:", f"R$ {saida['Comissão Prevista Gerente'].sum():,.2f}")
+    print("Comissão liberada gerente:", f"R$ {saida['Comissão Liberada Gerente'].sum():,.2f}")
 
 
 if __name__ == "__main__":
